@@ -1,0 +1,89 @@
+# ============================================================
+#  Sepsis early-prediction + treatment  --  DATA PREPARATION
+#  Only edit the lines marked  <== EDIT  if you must.
+# ============================================================
+
+bigquery:
+  billing_project: "my-sepsis-project-123456"   # <== EDIT if your GCP project id is different
+  location: "US"
+  source_project: "physionet-data"
+  hosp_dataset: "mimiciv_3_1_hosp"
+  icu_dataset: "mimiciv_3_1_icu"
+  derived_dataset: "mimiciv_3_1_derived"
+  max_gb_per_query: 50        # safety: BigQuery refuses any query bigger than this
+
+paths:
+  out_dir: "output"                          # everything is written here
+  early_dir: "early_prediction"              # output/early_prediction/batch_01.parquet ... batch_32.parquet
+  treatment_dir: "treatment_recommendation"  # output/treatment_recommendation/batch_01.parquet ... batch_32.parquet
+  work_dir: "_work"                          # cohort + raw hourly batches (needed to resume; delete at the very end to free disk)
+  file_format: "parquet"                     # "parquet" (small, fast) or "csv" (opens in Excel)
+
+cohort:
+  min_age: 18
+  min_icu_hours: 12           # ignore ICU stays shorter than this
+  first_icu_stay_only: true   # one stay per patient (cleanest, avoids repeat patients)
+  # How the sepsis "time zero" is chosen from MIMIC's derived sepsis3 table:
+  #   latest    = max(suspected_infection_time, sofa_time)  -> first moment BOTH Sepsis-3 criteria hold (default)
+  #   earliest  = min(suspected_infection_time, sofa_time)
+  #   infection = suspected_infection_time
+  #   sofa      = sofa_time
+  onset_rule: "latest"
+  min_hours_before_onset: 6   # sepsis stays must have >= this many ICU hours BEFORE onset (else nothing to predict from)
+  control_ratio: null         # null = keep ALL non-sepsis stays. e.g. 3 = keep 3 non-sepsis stays per sepsis stay
+  seed: 42
+  limit_stays: null           # null = everything. (smoke test sets this itself)
+
+hourly:
+  n_batches: 32               # the cohort is cut into exactly this many batches (each has sepsis AND non-sepsis stays)
+  max_icu_hours_nonsepsis: 240  # non-sepsis stays are cut at 10 days
+  post_onset_hours: 48        # sepsis stays are kept until onset + 48h (needed for treatment learning)
+  horizons: [6, 12, 24]       # label_sepsis_6h is the main target (predict 6h ahead)
+  ffill_hours: {vitals: 6, labs: 24}   # carry last value forward at most this long (never from the future)
+  add_obs_flags: true         # <feature>_obs = 1 if measured in this very hour
+
+split:
+  seed: 42
+  train: 0.70
+  validation: 0.15
+  test: 0.15
+
+treatment:
+  step_hours: 4               # one decision every 4 hours
+  window_before_onset_h: 24
+  window_after_onset_h: 48
+  n_bins: 5                   # 0 = none, 1..4 = quartiles of the non-zero doses (from TRAIN only) -> 5x5 = 25 actions
+  terminal_reward: 15         # +15 survived hospital / -15 died, given on the last step
+  sofa_reward_scale: 1.0      # per step: scale * (SOFA_before - SOFA_after)
+
+# Item IDs of IV fluids in inputevents. Run `python run.py audit-items` to SEE the labels and fix this list.
+fluid_itemids: [225158, 225159, 225161, 225828, 220949, 220952, 225823, 225825, 225827, 225941, 225943, 225944]
+
+vasopressor_itemids:
+  norepinephrine: 221906
+  epinephrine: 221289
+  dopamine: 221662
+  phenylephrine: 221749
+  vasopressin: 222315
+# conversion to norepinephrine-equivalent (same factors as mimic-code norepinephrine_equivalent_dose)
+vasopressor_factors: {norepinephrine: 1.0, epinephrine: 1.0, dopamine: 0.01, phenylephrine: 0.1, vasopressin: 2.5}
+
+# values outside these ranges are treated as sensor/typing errors -> missing
+plausible_ranges:
+  heart_rate: [10, 300]
+  sbp: [30, 300]
+  dbp: [10, 200]
+  mbp: [20, 250]
+  resp_rate: [1, 80]
+  temperature: [25, 45]
+  spo2: [20, 100]
+  gcs: [3, 15]
+  ph: [6.5, 8.0]
+  lactate: [0, 40]
+
+# static comorbidity flags (0/1) added to the treatment table as RL state/context: s_diabetes, s_heart_failure,
+# s_chronic_kidney_disease, s_chronic_liver_disease, s_cancer, s_immunosuppression   (ICD-9 + ICD-10 from diagnoses_icd)
+comorbidities:
+  enabled: true
+  chunk_size: 10000               # hadm_ids per BigQuery request
+  add_next_state_columns: true    # also write ns_<name> (identical value) so state and next_state have the same columns
