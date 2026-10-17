@@ -1,117 +1,271 @@
-# Sepsis data preparation (MIMIC-IV on BigQuery) — batch-wise, 8 GB laptop friendly
+# Data Preparation and Processing
 
-Builds the datasets for your project from **both sepsis and non-sepsis ICU patients**:
+**Module 1 of SEPSISADAPT.** This pipeline reads MIMIC-IV v3.1 directly from Google BigQuery and produces the two datasets used by the rest of the system:
 
-1. **Early-prediction data** – one row per patient per hour, label = *"sepsis starts within the next 6 h"*.
-2. **Treatment data** – for sepsis patients only: state / action (IV fluid × vasopressor, 25 actions) / reward / next-state, one row per 4 h.
+| Dataset | Granularity | Used by |
+|---------|-------------|---------|
+| Early-prediction dataset | One row per patient-hour (sepsis and non-sepsis patients) | Module 2: Early sepsis prediction (Temporal Transformer) |
+| Treatment dataset | One row per 4-hour step (sepsis patients only) | Module 3: Treatment recommendation (Conservative Q-Learning) |
 
-Nothing is trained here. No MIMIC CSV files needed – data is read from BigQuery, **in exactly 32 batches**
-(`hourly.n_batches` in `config.yaml`), and each finished batch is saved. Every batch contains **both sepsis and non-sepsis patients**
-(sepsis and non-sepsis stays are shuffled separately and dealt out evenly), and all 32 batches have the same size. If the internet or laptop dies, run the same command again — it continues.
+Both datasets are built from **one common cohort** and split **by patient** into train, validation and test sets.
 
-## Run it (copy-paste)
+---
+
+## Table of Contents
+
+1. [Pipeline Overview](#pipeline-overview)
+2. [Folder Structure](#folder-structure)
+3. [Prerequisites](#prerequisites)
+4. [Installation](#installation)
+5. [Configuration](#configuration)
+6. [Running the Pipeline](#running-the-pipeline)
+7. [Processing Steps](#processing-steps)
+8. [Output Datasets](#output-datasets)
+9. [Design Decisions](#design-decisions)
+10. [Testing](#testing)
+11. [Troubleshooting](#troubleshooting)
+
+---
+
+## Pipeline Overview
+
+```
+MIMIC-IV v3.1 (BigQuery)
+        |
+        v
+ Step 1  Base cohort (ICU stays)
+        |
+        v
+ Step 2  Demographics (static variables)
+        |
+        v
+ Step 3  Comorbidity flags (6 conditions)
+        |
+        v
+ Step 4  Hourly vital signs
+        |
+        v
+ Step 5  Hourly laboratory values + forward-fill
+        |
+        v
+ Step 6  Labels, observation flags and treatments
+        |
+        +-----------------------------+
+        v                             v
+ Early-prediction dataset      Step 7  Treatment dataset
+ (patient-hour rows)           (state, action, reward, next state)
+        |                             |
+        +--------------+--------------+
+                       v
+ Step 8  Finalize: patient-level train / validation / test split
+```
+
+---
+
+## Folder Structure
+
+```
+data_preparation_processing/
+|-- README.md             This file
+|-- config.yaml           Pipeline configuration
+|-- requirements.txt      Python dependencies
+|-- run.py                Pipeline entry point
+|-- sepsis_prep/          Pipeline package
+|   |-- bq.py             BigQuery client and query helpers
+|   |-- sql.py            SQL query definitions
+|   |-- cohort.py         Step 1: base cohort
+|   |-- comorbidity.py    Step 3: comorbidity flags
+|   |-- hourly.py         Steps 4-5: hourly vitals and labs
+|   |-- features.py       Feature definitions
+|   |-- treatment.py      Step 7: treatment (state, action, reward) table
+|   |-- finalize.py       Step 8: final datasets and splits
+|   `-- __init__.py
+`-- tests/
+    `-- test_pipeline.py  Pipeline tests
+```
+
+---
+
+## Prerequisites
+
+- Python 3.9 or later
+- A Google Cloud project with BigQuery enabled
+- Credentialed access to MIMIC-IV v3.1 on BigQuery (PhysioNet account, CITI training and signed data use agreement)
+- Authenticated Google Cloud credentials on your machine
+
+> **Data policy:** MIMIC-IV is a credentialed dataset. Never commit patient data, exported tables or credential files to this repository.
+
+---
+
+## Installation
 
 ```bash
-# 1. once: environment
-python -m venv .venv
-.venv\Scripts\activate            # Windows   (Mac/Linux: source .venv/bin/activate)
+git clone https://github.com/aksharadileep/SEPSISADAPT.git
+cd SEPSISADAPT/data_preparation_processing
+
+python -m venv venv
+venv\Scripts\activate          # Windows
+# source venv/bin/activate     # Linux / macOS
+
 pip install -r requirements.txt
-
-# 2. once: Google login (same Google account that has MIMIC-IV access on PhysioNet/BigQuery)
-gcloud auth application-default login
-gcloud auth application-default set-quota-project my-sepsis-project-123456
-
-# 3. check everything (FREE, nothing is billed)
-python run.py check
-python run.py audit-items          # look at the fluid labels, fix fluid_itemids in config.yaml if any is wrong
-
-# 4. tiny test first (200 stays, a few minutes)
-python run.py smoke
-
-# 5. the real run
-python run.py cohort
-python run.py estimate             # free: shows how many GB BigQuery will read
-python run.py extract              # long step, resumable. Run again if it stops.
-python run.py finalize
-# (or just:  python run.py all)
-python run.py status               # progress any time
 ```
-If your GCP project id is not `my-sepsis-project-123456`, change `billing_project` in `config.yaml`.
 
-## What you get
-
-```
-output/
-├── early_prediction/            batch_01.parquet ... batch_32.parquet   sepsis + non-sepsis patients, 1 row = 1 patient-hour
-├── treatment_recommendation/    batch_01.parquet ... batch_32.parquet   sepsis patients only, 1 row = 1 four-hour treatment step
-├── feature_columns.json         which columns are model inputs / labels / must never be inputs
-├── train_stats.json             train-only medians, mean, std + the fluid & vasopressor bin cut-points
-├── data_report.json             counts per split AND per batch, label prevalence, validation result
-└── _work/                       cohort + raw batches (needed to resume; you may delete it when everything is finished)
-```
-Every row has a `split` column (train / validation / test, decided per **patient**), so you can still split without mixing patients.
-
-* `early_prediction` label: `label_sepsis_6h` = 1 if sepsis starts within the next 6 h (also `_12h`, `_24h`). `is_sepsis_stay` tells sepsis vs non-sepsis patient.
-* `treatment_recommendation` columns: patient/stay ids, `s_*` = patient state before the step (vitals, labs, age, sex, weight, SOFA ...),
-  `fluid_block` (mL given) and `vaso_block` (norepinephrine-equivalent) = **the treatment actually given**, `action_fluid_bin`, `action_vaso_bin`, `action` (0..24),
-  `reward`, `done`, `ns_*` = state after the step, `hospital_expire_flag` = outcome.
-
-Load one batch at a time (8 GB RAM friendly):
-```python
-import pandas as pd, json
-fc = json.load(open("output/feature_columns.json"))
-b = pd.read_parquet("output/early_prediction/batch_01.parquet")
-X, y = b[fc["model_inputs"]], b["label_sepsis_6h"]
-steps = pd.read_parquet("output/treatment_recommendation/batch_01.parquet")
-```
-Training in a loop over the 32 files (never loads everything at once):
-```python
-from pathlib import Path
-for f in sorted(Path("output/early_prediction").glob("batch_*.parquet")):
-    b = pd.read_parquet(f); tr = b[b["split"] == "train"]
-    # model.partial_fit(tr[fc["model_inputs"]], tr["label_sepsis_6h"])   # or one training epoch per file
-```
-Want CSV instead? set `paths.file_format: "csv"` in `config.yaml` and run `python run.py finalize` again.
-
-## Rules built in (so the data is honest)
-* **Patient-level split** 70/15/15 – one patient is never in two splits.
-* **Label**: 1 only if sepsis onset is *after* the row and within 6 h (also 12 h, 24 h columns). Rows at/after onset are **not** in the prediction files.
-* **No future leakage**: row `timestamp` = end of the hour; values carried forward only (vitals ≤ 6 h, labs ≤ 24 h), never backward.
-* **Missing values**: filled with **train-only** medians; `<feature>_obs` = 1 means really measured that hour.
-* Garbage values (HR 999 etc.) become missing (`plausible_ranges` in config).
-* **Sepsis** = MIMIC `derived.sepsis3` with `sepsis3 = TRUE`. **Non-sepsis** = every other adult ICU stay (includes patients with infection but no sepsis — the harder, realistic controls).
-* Sepsis time-zero rule is `latest` = first moment infection **and** organ dysfunction both hold (change `onset_rule` in config).
-* `sofa_24h` is provided but **not** in `model_inputs` (the Sepsis-3 label is defined with SOFA, so it makes the task artificially easy). Add it from `optional_inputs` if you want.
-* Treatment actions: fluid mL and vasopressor (norepinephrine-equivalent) per 4 h → bins 0 (none) + 4 quartiles of non-zero doses from TRAIN → 5×5 = 25 actions. Reward = SOFA improvement, ±15 at the end for survival.
-
-## Comorbidities (treatment table, RL context features)
-Six static 0/1 columns, added to `treatment_recommendation` as **state context** (never actions):
-`s_diabetes`, `s_heart_failure`, `s_chronic_kidney_disease`, `s_chronic_liver_disease`, `s_cancer`, `s_immunosuppression`
-(plus identical `ns_*` twins so state and next_state have the same columns; set `comorbidities.add_next_state_columns: false` to drop them).
+Authenticate with Google Cloud:
 
 ```bash
-python run.py comorbidities   # after `cohort`; one small query on diagnoses_icd, writes _work/comorbidities.parquet
-python run.py finalize        # merges them; refuses to run if the file is missing
+gcloud auth application-default login
 ```
-* Source `hosp.diagnoses_icd`, ICD-9 **and** ICD-10 (matched per version). Rules + clinical scope: `sepsis_prep/comorbidity.py`.
-* Link: `(subject_id, hadm_id)` -> `stay_id`. Never `subject_id` alone. Diagnosis rows whose pair does not match the cohort are dropped and counted.
-* A stay whose admission has no diagnosis rows gets 0 ("not documented"); the count is in `_work/comorbidity_report.json`.
-* Merged **after** action / reward / done are built; the code asserts that every pre-existing column and row is unchanged.
-* No sepsis, infection or acute-organ-failure code is used by any rule (unit-tested).
-* **Limitation (important):** `diagnoses_icd` is coded at hospital *discharge* and has no timestamp. The six conditions are chronic,
-  so this is the standard practice, but a few codes (e.g. a cancer first diagnosed during the stay) can be documented only
-  at discharge. Stricter alternative if you need it: use only codes from the patient's *earlier* admissions.
-* Existing 32 raw batches do **not** need to be re-extracted; `batch_id` and `split` are unchanged.
 
-## Size / time knobs (`config.yaml`)
-* RAM problem → raise `hourly.n_batches` (e.g. 64, smaller batches). Cheaper BigQuery bill → fewer batches.
-* Smaller dataset → `cohort.control_ratio: 3` (3 non-sepsis stays per sepsis stay) or `cohort.limit_stays`.
-* Changing cohort settings after `extract` started → delete `output/_work/` and run `cohort` + `extract` again (it will tell you).
+---
 
-## If something fails
-* `check` says *Access Denied* → redo step 2, and confirm your MIMIC-IV BigQuery access.
-* `check` says *Unrecognized name* → that derived table has a different column in your dataset; send me the line.
-* Stopped midway → run the same command again. Finished batches are never redone.
-* Everything is logged in `output/_work/run.log`.
+## Configuration
 
-Tests (no internet needed): `pip install pytest && python -m pytest -q`
+All settings are in `config.yaml`. Review it before the first run, in particular:
+
+- the Google Cloud project used to run the queries
+- the MIMIC-IV dataset location on BigQuery
+- the output directory for the generated datasets
+- the list of measured variables, the prediction horizons and the treatment step length
+
+Keep project identifiers and paths in the config file. Do not hard-code them in the source files.
+
+---
+
+## Running the Pipeline
+
+From inside the `data_preparation_processing` folder:
+
+```bash
+python run.py
+```
+
+Run it from this folder so that relative paths in `config.yaml` resolve correctly.
+
+---
+
+## Processing Steps
+
+### Step 1: Base cohort
+
+`sepsis_prep/cohort.py`
+
+The cohort is built from the ICU stays table (`icustays`). Each ICU stay is one record in the cohort and carries the identifiers (patient, hospital admission, ICU stay) that every later step joins on. This single cohort feeds both output datasets, so the early-prediction data and the treatment data always describe the same patients.
+
+### Step 2: Demographics (static variables)
+
+Static patient information is attached to each cohort record. These variables do not change over the stay and are repeated on every hourly row in the final dataset.
+
+### Step 3: Comorbidity flags
+
+`sepsis_prep/comorbidity.py`
+
+Pre-existing conditions are derived from the hospital diagnosis codes (`diagnoses_icd`). Six binary flags are produced for each patient:
+
+| Flag | Condition |
+|------|-----------|
+| 1 | Diabetes |
+| 2 | Chronic kidney disease (CKD) |
+| 3 | Congestive heart failure (CHF) |
+| 4 | Liver disease |
+| 5 | Cancer |
+| 6 | Immunosuppression |
+
+The flags are used as explicit state variables in the treatment dataset (Module 3).
+
+### Step 4: Hourly vital signs
+
+`sepsis_prep/hourly.py`, `sepsis_prep/features.py`
+
+Vital signs are extracted from the charted events table (`chartevents`) and aggregated onto an hourly grid that starts at ICU admission. Each ICU stay becomes a sequence of one-hour rows.
+
+### Step 5: Hourly laboratory values and forward-fill
+
+`sepsis_prep/hourly.py`
+
+Laboratory results are extracted from the lab events table (`labevents`) and placed on the same hourly grid. Labs are measured irregularly, so most hours have no new value. Missing hours are filled by carrying the last measured value forward in time. Values are only ever carried forward, never backward, so no future information leaks into earlier hours.
+
+### Step 6: Labels, observation flags and treatments
+
+`sepsis_prep/hourly.py`, `sepsis_prep/finalize.py`
+
+- **Observation flags.** For each of the 33 measured variables, a binary flag records whether the value in that hour was really measured (1) or carried forward or filled (0). The model can use these flags to learn how much to trust each value.
+- **Prediction labels.** For every patient-hour, labels mark whether sepsis begins within the next 6, 12 and 24 hours. The 6-hour label (`label_sepsis_6h`) is the primary prediction target.
+- **Treatments.** IV fluid and vasopressor information is added to the hourly records.
+
+### Step 7: Treatment dataset (state, action, reward)
+
+`sepsis_prep/treatment.py`
+
+For sepsis patients only, the hourly data around sepsis onset is converted into a reinforcement-learning dataset with one row per **4-hour step**:
+
+| Column | Description |
+|--------|-------------|
+| state | 41 patient variables at the start of the step |
+| comorbidity flags | The six flags from Step 3, appended to the state |
+| action | One of 25 discrete actions: 5 IV fluid groups x 5 vasopressor groups |
+| reward | Improvement in SOFA score over the step |
+| next state | State at the start of the following step |
+| done flag | Marks the final step of an episode |
+
+A terminal reward of **+15** is added for survival or **-15** for death at the end of the episode.
+
+### Step 8: Finalize and split
+
+`sepsis_prep/finalize.py`
+
+The final tables are written and divided into **train, validation and test** sets. The split is made **by patient**, so all hours and steps of one patient fall in exactly one set. This prevents leakage between sets.
+
+---
+
+## Output Datasets
+
+### Early-prediction dataset
+
+| Content | Count / description |
+|---------|---------------------|
+| Measured variables | 33 |
+| Observation flags | 33 (one per measured variable) |
+| Treatments | IV fluid and vasopressor information |
+| Static variables | Demographics and related fields |
+| Labels | Sepsis onset within 6, 12 and 24 hours |
+| Granularity | One row per patient-hour |
+
+### Treatment dataset
+
+| Content | Count / description |
+|---------|---------------------|
+| State | 41 variables plus 6 comorbidity flags |
+| Actions | 25 (5 fluid groups x 5 vasopressor groups) |
+| Reward | SOFA improvement, plus +15 / -15 terminal reward |
+| Granularity | One row per 4-hour step |
+| Population | Sepsis patients only |
+
+---
+
+## Design Decisions
+
+| Decision | Reason |
+|----------|--------|
+| One common cohort for both datasets | Keeps the prediction and treatment data consistent |
+| Direct reading from BigQuery | No need to download the large MIMIC-IV tables locally |
+| Forward-fill with observation flags | Handles irregular measurements without hiding which values are real |
+| Forward-only filling | Prevents information from the future leaking into earlier hours |
+| Patient-level split | Prevents leakage between train, validation and test sets |
+| Treatment data from sepsis patients only | Treatment learning needs the data around sepsis onset |
+| 4-hour steps | Standard step length for sepsis reinforcement-learning setups |
+| Comorbidity flags in the RL state | Lets the recommendation depend on the patient's pre-existing conditions |
+
+---
+
+## Testing
+
+```bash
+pip install pytest
+pytest tests/
+```
+
+The tests in `tests/test_pipeline.py` check the pipeline logic.
+
+---
+
+|
